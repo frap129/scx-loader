@@ -2,18 +2,20 @@
 
 //! Application state and event loop.
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use scx_loader::SchedMode;
 
+use crate::args::{expand_input, ArgsExpandError};
 use crate::backend::loader::LoaderBackend;
 use crate::backend::service::ServiceBackend;
-use crate::backend::{Capabilities, SchedulerBackend, Status};
+use crate::backend::{Capabilities, ModeArgs, SchedulerBackend, Status};
 use crate::kernel::{self, KernelState};
 use crate::logs::{self, LogLine};
 use crate::ui;
@@ -79,14 +81,60 @@ pub fn make_backend(kind: BackendKind) -> Result<Box<dyn SchedulerBackend>> {
 /// loop right after the frame announcing them has been drawn. Backend
 /// calls block (a hung daemon holds the D-Bus timeout, ~25 s), so the UI
 /// must show feedback *before* making them.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PendingAction {
     StartOrSwitch,
+    /// Expanded field content; see [`App::submit_args`].
+    StartOrSwitchWithArgs(Vec<String>),
     Stop,
     Restart,
     RestoreDefault,
     ToggleBackend,
     Monitor,
+}
+
+/// State of the session-only custom-arguments field. The cursor is
+/// counted in characters, not bytes, so editing multi-byte input stays
+/// sound; the UI derives its cursor block from the same count.
+#[derive(Default)]
+pub struct ArgsInput {
+    pub buffer: String,
+    pub cursor: usize,
+}
+
+impl ArgsInput {
+    /// Byte offset of the character cursor, for `String` edits.
+    fn byte_cursor(&self) -> usize {
+        self.buffer
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.buffer.len(), |(idx, _)| idx)
+    }
+
+    fn len_chars(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = self.byte_cursor();
+        self.buffer.insert(at, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let at = self.byte_cursor();
+            self.buffer.remove(at);
+        }
+    }
+
+    fn delete(&mut self) {
+        let at = self.byte_cursor();
+        if at < self.buffer.len() {
+            self.buffer.remove(at);
+        }
+    }
 }
 
 /// Which screen is currently shown.
@@ -113,8 +161,18 @@ pub struct App {
     /// The kernel's own view of `sched_ext`, refreshed alongside `status`.
     /// `None` = kernel without `sched_ext` support.
     pub kernel: Option<KernelState>,
-    /// Configured modes for the currently selected scheduler.
-    pub configured_modes: Vec<SchedMode>,
+    /// Lazily filled per-scheduler answers to the backend's mode-argument
+    /// query. An absent key means "not fetched yet or the query failed" —
+    /// never "nothing configured" — so consumers fail open on it. Valid
+    /// for the lifetime of one daemon instance; see
+    /// [`Self::check_daemon_instance`].
+    mode_args: HashMap<String, ModeArgs>,
+    /// Last observed backend instance token; a change invalidates
+    /// `mode_args`.
+    daemon_instance: Option<String>,
+    /// Custom-arguments field; `Some` while the user is typing. While
+    /// open it owns every key press.
+    pub args_input: Option<ArgsInput>,
     pub message: Option<Message>,
     /// Timestamp of the last scheduler-affecting action, for debouncing.
     last_action: Option<Instant>,
@@ -147,7 +205,9 @@ impl App {
             mode_idx: 0,
             status: None,
             kernel: None,
-            configured_modes: Vec::new(),
+            mode_args: HashMap::new(),
+            daemon_instance: None,
+            args_input: None,
             message: None,
             last_action: None,
             view: View::Schedulers,
@@ -181,15 +241,38 @@ impl App {
         MODES[self.mode_idx]
     }
 
+    /// Resolved arguments for the selected scheduler and mode, when
+    /// known. `None` covers "not fetched / query failed" as well as a mode
+    /// the daemon did not report; the preview only renders a known,
+    /// non-empty list, so both collapse into "nothing to show".
+    pub fn selected_mode_args(&self) -> Option<&[String]> {
+        let modes = self.mode_args.get(self.selected_scheduler()?)?;
+        let mode = self.selected_mode();
+        modes
+            .iter()
+            .find(|(m, _)| *m == mode)
+            .map(|(_, args)| args.as_slice())
+    }
+
     /// Whether the selected mode has configured arguments for the selected
-    /// scheduler. Mirrors scxctl's client-side warning: `Auto` always counts,
-    /// and an earlier query failure fails open (empty list is treated as
-    /// "unknown", not as "nothing configured") so we never scare the user
-    /// over a transient D-Bus hiccup.
+    /// scheduler. Mirrors scxctl's client-side warning: `Auto` always
+    /// counts, and an unknown answer (never fetched, or the query failed —
+    /// either way no cache entry) fails open so we never scare the user
+    /// over a transient D-Bus hiccup. A *successful* answer is exact: the
+    /// daemon reports every mode, so a mode missing its arguments there
+    /// genuinely has none configured.
     pub fn selected_mode_configured(&self) -> bool {
-        self.selected_mode() == SchedMode::Auto
-            || self.configured_modes.is_empty()
-            || self.configured_modes.contains(&self.selected_mode())
+        let mode = self.selected_mode();
+        if mode == SchedMode::Auto {
+            return true;
+        }
+        let Some(modes) = self
+            .selected_scheduler()
+            .and_then(|sched| self.mode_args.get(sched))
+        else {
+            return true;
+        };
+        modes.iter().any(|(m, args)| *m == mode && !args.is_empty())
     }
 
     pub fn run(&mut self, mut terminal: DefaultTerminal) -> Result<()> {
@@ -287,6 +370,7 @@ or your distro's scx tools package)",
     fn run_action(&mut self, action: PendingAction, terminal: &mut DefaultTerminal) -> Result<()> {
         match action {
             PendingAction::StartOrSwitch => self.start_or_switch(),
+            PendingAction::StartOrSwitchWithArgs(args) => self.start_or_switch_with_args(&args),
             PendingAction::Stop => self.act("stopped", |b| b.stop()),
             PendingAction::Restart => self.restart_scheduler(),
             PendingAction::RestoreDefault => {
@@ -299,9 +383,70 @@ or your distro's scx tools package)",
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if self.view == View::Schedulers && self.args_input.is_some() {
+            self.on_key_args(key);
+            return;
+        }
         match self.view {
             View::Schedulers => self.on_key_schedulers(key),
             View::Logs => self.on_key_logs(key),
+        }
+    }
+
+    /// Key handling while the custom-arguments field is open. The field
+    /// owns every key press: global shortcuts must not fire while the
+    /// user is typing text that may well contain their letters — which
+    /// also means `Esc` closes the field here instead of quitting.
+    fn on_key_args(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.args_input = None,
+            KeyCode::Enter => self.submit_args(),
+            code => {
+                let Some(input) = self.args_input.as_mut() else {
+                    return;
+                };
+                match code {
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        input.insert(c);
+                    }
+                    KeyCode::Backspace => input.backspace(),
+                    KeyCode::Delete => input.delete(),
+                    KeyCode::Left => input.cursor = input.cursor.saturating_sub(1),
+                    KeyCode::Right => input.cursor = (input.cursor + 1).min(input.len_chars()),
+                    KeyCode::Home => input.cursor = 0,
+                    KeyCode::End => input.cursor = input.len_chars(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// `Enter` in the field: expand exactly like scxctl's `--args`, then
+    /// queue the start/switch. Expansion errors keep the field open with
+    /// the message bar explaining what to fix; only a successfully queued
+    /// action closes it.
+    fn submit_args(&mut self) {
+        let Some(buffer) = self.args_input.as_ref().map(|input| input.buffer.clone()) else {
+            return;
+        };
+        match expand_input(&buffer) {
+            Ok(args) => {
+                if self.action_allowed() {
+                    self.args_input = None;
+                    self.queue(PendingAction::StartOrSwitchWithArgs(args));
+                }
+            }
+            Err(ArgsExpandError::Parse(msg)) => {
+                self.error(&format!(
+                    "invalid arguments: {msg} — quotes must be balanced and cannot span a comma"
+                ));
+            }
+            Err(ArgsExpandError::Empty) => {
+                self.error(
+                    "arguments expanded to nothing — to run with scheduler defaults, \
+press Esc and use Enter instead",
+                );
+            }
         }
     }
 
@@ -321,6 +466,11 @@ or your distro's scx tools package)",
             }
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
+            KeyCode::Char('a') if self.backend.capabilities().custom_args => {
+                if self.selected_scheduler().is_some() {
+                    self.args_input = Some(ArgsInput::default());
+                }
+            }
             KeyCode::Tab | KeyCode::Char('m') if self.backend.capabilities().modes => {
                 self.cycle_mode(true);
             }
@@ -352,6 +502,9 @@ or your distro's scx tools package)",
                 // same rule as refresh_status not touching the message bar.
                 let list_ok = self.refresh_schedulers();
                 self.refresh_status();
+                // Manual refresh means "give me the current truth", so the
+                // lazy cache must not satisfy it with old answers.
+                self.mode_args.clear();
                 self.refresh_modes();
                 if list_ok {
                     self.info("refreshed");
@@ -402,6 +555,11 @@ or your distro's scx tools package)",
                 self.schedulers = schedulers;
                 self.selected = 0;
                 self.mode_idx = 0;
+                // Instance tokens are per-backend; comparing across
+                // backends would be meaningless, so both the cache and the
+                // observed token start over.
+                self.mode_args.clear();
+                self.daemon_instance = None;
                 self.refresh_status();
                 self.sync_selection_to_running();
                 self.refresh_modes();
@@ -582,6 +740,58 @@ or your distro's scx tools package)",
         self.refresh_status();
     }
 
+    /// The with-args sibling of [`Self::start_or_switch`]: the same
+    /// start-vs-switch decision against a re-read daemon state, but the
+    /// scheduler receives the expanded field content instead of a mode.
+    /// The arguments are session-only — the loader keeps them for this
+    /// run and nothing is written to its config — and both the success
+    /// notice and a failure render them in the same shell-words form the
+    /// status panel and scxctl use.
+    fn start_or_switch_with_args(&mut self, args: &[String]) {
+        let Some(sched) = self.selected_scheduler().map(str::to_owned) else {
+            return;
+        };
+        // Same staleness concern as in `start_or_switch`.
+        self.refresh_status();
+        let running = self
+            .status
+            .as_ref()
+            .and_then(|status| status.current.clone());
+
+        let result = if running.is_some() {
+            self.backend.switch_with_args(&sched, args)
+        } else {
+            self.backend.start_with_args(&sched, args)
+        };
+
+        let rendered = shell_words::join(args);
+        match result {
+            Ok(()) => {
+                let verb = if running.is_none() {
+                    "started"
+                } else if running.as_deref() == Some(sched.as_str()) {
+                    "restarted"
+                } else {
+                    "switched to"
+                };
+                self.info(&format!(
+                    "{verb} {sched} with args: {rendered} (session-only)"
+                ));
+            }
+            Err(err) => {
+                let verb = if running.is_some() {
+                    "switch to"
+                } else {
+                    "start"
+                };
+                self.error(&format!(
+                    "{verb} {sched} with args '{rendered}' failed: {err:#}"
+                ));
+            }
+        }
+        self.refresh_status();
+    }
+
     /// `r`: restart. Plain `RestartScheduler` deliberately reuses the
     /// original configuration, so by itself it can never apply a mode
     /// change — and the very first piece of community feedback was someone
@@ -641,6 +851,7 @@ or your distro's scx tools package)",
     fn refresh_status(&mut self) {
         self.status = self.backend.status().ok();
         self.kernel = kernel::read();
+        self.check_daemon_instance();
     }
 
     /// Re-enumerates the scheduler list. The list is otherwise fetched
@@ -665,15 +876,50 @@ or your distro's scx tools package)",
         }
     }
 
+    /// Lazily fills the per-scheduler argument cache. The daemon reads its
+    /// configuration once at startup, so a successful answer stays valid
+    /// until the daemon itself is replaced — which `check_daemon_instance`
+    /// watches for. A failed query is deliberately *not* cached: an absent
+    /// entry reads as "unknown" (fail open in `selected_mode_configured`)
+    /// and the next call here simply retries.
     fn refresh_modes(&mut self) {
-        self.configured_modes = match self.selected_scheduler() {
-            Some(sched) if self.backend.capabilities().modes => {
-                // Fail open: an empty list means "unknown" to
-                // `selected_mode_configured`, not "nothing configured".
-                self.backend.configured_modes(sched).unwrap_or_default()
-            }
-            _ => Vec::new(),
+        if !self.backend.capabilities().modes {
+            return;
+        }
+        let Some(sched) = self.selected_scheduler() else {
+            return;
         };
+        if self.mode_args.contains_key(sched) {
+            return;
+        }
+        let sched = sched.to_owned();
+        if let Ok(modes) = self.backend.mode_args(&sched) {
+            self.mode_args.insert(sched, modes);
+        }
+    }
+
+    /// Detects a daemon restart via the backend's instance token and drops
+    /// the mode-argument cache when one happened. A replaced daemon is the
+    /// one event that can make cached configuration answers stale (the
+    /// daemon reads its config once at startup) — watching the config
+    /// file's mtime instead would be both weaker (an edit without a
+    /// restart changes nothing) and blind to a restart with an unchanged
+    /// file. Rides along the periodic status refresh, so an external
+    /// `systemctl restart scx_loader` is picked up within one poll even
+    /// though D-Bus activation hides it from the calls themselves.
+    fn check_daemon_instance(&mut self) {
+        let Some(token) = self.backend.instance_token() else {
+            return;
+        };
+        if self
+            .daemon_instance
+            .as_deref()
+            .is_some_and(|old| old != token)
+        {
+            self.mode_args.clear();
+            self.refresh_modes();
+        }
+        self.daemon_instance = Some(token);
     }
 
     fn info(&mut self, text: &str) {
@@ -695,38 +941,86 @@ or your distro's scx tools package)",
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use anyhow::anyhow;
+
     use super::*;
 
-    /// Minimal in-memory backend: enough for exercising selection logic
-    /// without a D-Bus connection.
+    /// Minimal in-memory backend: enough for exercising selection and
+    /// caching logic without a D-Bus connection.
     struct StubBackend {
         schedulers: Vec<String>,
+        /// Per-scheduler answer for `mode_args`; a missing key errors,
+        /// modeling a failed D-Bus query.
+        modes: HashMap<String, ModeArgs>,
+        /// How many times `mode_args` reached the backend, shared with the
+        /// test so caching is observable from the outside.
+        mode_queries: Rc<RefCell<usize>>,
+        /// Current instance token, shared so a test can "restart" the
+        /// daemon underneath the app.
+        token: Rc<RefCell<Option<String>>>,
+    }
+
+    impl StubBackend {
+        fn new() -> Self {
+            Self {
+                schedulers: vec!["scx_bpfland".into(), "scx_lavd".into(), "scx_cake".into()],
+                modes: HashMap::new(),
+                mode_queries: Rc::new(RefCell::new(0)),
+                token: Rc::new(RefCell::new(None)),
+            }
+        }
     }
 
     impl SchedulerBackend for StubBackend {
         fn label(&self) -> &'static str {
             "stub"
         }
+        fn instance_token(&self) -> Option<String> {
+            self.token.borrow().clone()
+        }
         fn capabilities(&self) -> Capabilities {
             Capabilities {
                 live_switch: true,
                 modes: true,
+                custom_args: true,
                 restore_default: true,
             }
         }
         fn status(&self) -> Result<Status> {
-            unreachable!("tests set App::status directly")
+            // Benign "nothing running" answer, so tests may drive paths
+            // that refresh the status; tests interested in a particular
+            // state still set `App::status` directly afterwards.
+            Ok(Status {
+                current: None,
+                mode: SchedMode::Auto,
+                args: Vec::new(),
+                default_sched: None,
+                default_mode: SchedMode::Auto,
+            })
         }
         fn supported_schedulers(&self) -> Result<Vec<String>> {
             Ok(self.schedulers.clone())
         }
-        fn configured_modes(&self, _sched: &str) -> Result<Vec<SchedMode>> {
-            Ok(Vec::new())
+        fn mode_args(&self, sched: &str) -> Result<ModeArgs> {
+            *self.mode_queries.borrow_mut() += 1;
+            self.modes
+                .get(sched)
+                .cloned()
+                .ok_or_else(|| anyhow!("no mode answer configured for {sched}"))
         }
         fn start(&self, _sched: &str, _mode: SchedMode) -> Result<()> {
             Ok(())
         }
         fn switch(&self, _sched: &str, _mode: SchedMode) -> Result<()> {
+            Ok(())
+        }
+        fn start_with_args(&self, _sched: &str, _args: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn switch_with_args(&self, _sched: &str, _args: &[String]) -> Result<()> {
             Ok(())
         }
         fn stop(&self) -> Result<()> {
@@ -740,13 +1034,31 @@ mod tests {
         }
     }
 
+    /// Answer for the default selection (`scx_bpfland`): gaming has
+    /// arguments, powersave is present but empty, the rest untouched.
+    fn bpfland_modes() -> ModeArgs {
+        vec![
+            (SchedMode::Auto, Vec::new()),
+            (
+                SchedMode::Gaming,
+                vec!["-k".into(), "-s".into(), "5000".into()],
+            ),
+            (SchedMode::PowerSave, Vec::new()),
+        ]
+    }
+
+    fn app_with_backend(backend: StubBackend) -> App {
+        App::new(BackendKind::Loader, Box::new(backend)).unwrap()
+    }
+
     fn app_with_status(status: Status) -> App {
-        let backend = StubBackend {
-            schedulers: vec!["scx_bpfland".into(), "scx_lavd".into(), "scx_cake".into()],
-        };
-        let mut app = App::new(BackendKind::Loader, Box::new(backend)).unwrap();
+        let mut app = app_with_backend(StubBackend::new());
         app.status = Some(status);
         app
+    }
+
+    fn select_mode(app: &mut App, mode: SchedMode) {
+        app.mode_idx = MODES.iter().position(|m| *m == mode).unwrap();
     }
 
     fn running(current: &str, mode: SchedMode, args: &[&str]) -> Status {
@@ -757,6 +1069,222 @@ mod tests {
             default_sched: None,
             default_mode: SchedMode::Auto,
         }
+    }
+
+    #[test]
+    fn configured_follows_the_cached_argument_lists() {
+        let mut backend = StubBackend::new();
+        backend.modes.insert("scx_bpfland".into(), bpfland_modes());
+        let mut app = app_with_backend(backend);
+        app.refresh_modes();
+
+        select_mode(&mut app, SchedMode::Auto);
+        assert!(app.selected_mode_configured(), "Auto always counts");
+        select_mode(&mut app, SchedMode::Gaming);
+        assert!(app.selected_mode_configured(), "non-empty arguments");
+        select_mode(&mut app, SchedMode::PowerSave);
+        assert!(
+            !app.selected_mode_configured(),
+            "present in the answer with an empty argument list"
+        );
+        select_mode(&mut app, SchedMode::Server);
+        assert!(
+            !app.selected_mode_configured(),
+            "absent from a successful answer means not configured"
+        );
+    }
+
+    #[test]
+    fn unknown_answer_fails_open() {
+        // No cache entry — the query failed and nothing was stored. Every
+        // mode must count as configured so a transient D-Bus hiccup never
+        // produces a scary warning.
+        let mut app = app_with_backend(StubBackend::new());
+        select_mode(&mut app, SchedMode::Server);
+        assert!(app.selected_mode_configured());
+    }
+
+    #[test]
+    fn selected_mode_args_follows_the_selection() {
+        let mut backend = StubBackend::new();
+        backend.modes.insert("scx_bpfland".into(), bpfland_modes());
+        let mut app = app_with_backend(backend);
+        app.refresh_modes();
+
+        select_mode(&mut app, SchedMode::Gaming);
+        let expected = ["-k", "-s", "5000"].map(str::to_string);
+        assert_eq!(app.selected_mode_args(), Some(&expected[..]));
+
+        select_mode(&mut app, SchedMode::Server);
+        assert_eq!(
+            app.selected_mode_args(),
+            None,
+            "a mode absent from the answer has nothing to preview"
+        );
+
+        // scx_lavd has no cache entry at all: same outcome, for the
+        // "unknown" reason.
+        app.selected = 1;
+        assert_eq!(app.selected_mode_args(), None);
+    }
+
+    #[test]
+    fn cache_serves_repeat_queries() {
+        let mut backend = StubBackend::new();
+        backend.modes.insert("scx_bpfland".into(), bpfland_modes());
+        let queries = Rc::clone(&backend.mode_queries);
+        let mut app = app_with_backend(backend);
+
+        app.refresh_modes();
+        app.refresh_modes();
+        assert_eq!(*queries.borrow(), 1, "second call must hit the cache");
+    }
+
+    #[test]
+    fn failed_query_is_not_cached() {
+        // The stub has no answer for any scheduler, so every query fails.
+        let backend = StubBackend::new();
+        let queries = Rc::clone(&backend.mode_queries);
+        let mut app = app_with_backend(backend);
+
+        app.refresh_modes();
+        app.refresh_modes();
+        assert_eq!(
+            *queries.borrow(),
+            2,
+            "a failure must stay uncached so the next call retries"
+        );
+    }
+
+    #[test]
+    fn daemon_restart_clears_the_cache() {
+        let mut backend = StubBackend::new();
+        backend.modes.insert("scx_bpfland".into(), bpfland_modes());
+        let queries = Rc::clone(&backend.mode_queries);
+        let token = Rc::clone(&backend.token);
+        let mut app = app_with_backend(backend);
+
+        *token.borrow_mut() = Some(":1.7".into());
+        app.check_daemon_instance();
+        app.refresh_modes();
+        assert_eq!(*queries.borrow(), 1);
+
+        // Same daemon: the periodic check must not disturb the cache.
+        app.check_daemon_instance();
+        app.refresh_modes();
+        assert_eq!(*queries.borrow(), 1);
+
+        // "Restart" the daemon: new unique name, cache dropped and the
+        // selected scheduler refetched immediately.
+        *token.borrow_mut() = Some(":1.9".into());
+        app.check_daemon_instance();
+        assert_eq!(*queries.borrow(), 2);
+    }
+
+    #[test]
+    fn manual_refresh_bypasses_the_cache() {
+        let mut backend = StubBackend::new();
+        backend.modes.insert("scx_bpfland".into(), bpfland_modes());
+        let queries = Rc::clone(&backend.mode_queries);
+        let mut app = app_with_backend(backend);
+
+        app.refresh_modes();
+        assert_eq!(*queries.borrow(), 1);
+        app.on_key(KeyEvent::from(KeyCode::Char('R')));
+        assert_eq!(
+            *queries.borrow(),
+            2,
+            "R must refetch instead of serving the cache"
+        );
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn args_field_opens_on_a_and_owns_global_keys() {
+        let mut app = app_with_backend(StubBackend::new());
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.args_input.is_some());
+
+        // 'q' quits globally, but inside the field it is just a letter.
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.should_quit);
+        assert_eq!(app.args_input.as_ref().unwrap().buffer, "q");
+
+        // Esc closes the field instead of quitting the app.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.args_input.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn args_field_edits_at_the_character_cursor() {
+        let mut app = app_with_backend(StubBackend::new());
+        app.on_key(key(KeyCode::Char('a')));
+        type_str(&mut app, "ad");
+        app.on_key(key(KeyCode::Left));
+        type_str(&mut app, "bc");
+        app.on_key(key(KeyCode::End));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.args_input.as_ref().unwrap().buffer, "abc");
+
+        // Multi-byte characters: the cursor counts characters, not bytes.
+        app.on_key(key(KeyCode::Home));
+        type_str(&mut app, "żó");
+        app.on_key(key(KeyCode::Home));
+        app.on_key(key(KeyCode::Delete));
+        assert_eq!(app.args_input.as_ref().unwrap().buffer, "óabc");
+    }
+
+    #[test]
+    fn args_parse_error_keeps_the_field_open() {
+        let mut app = app_with_backend(StubBackend::new());
+        app.on_key(key(KeyCode::Char('a')));
+        type_str(&mut app, "--name \"foo");
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(app.args_input.is_some(), "the user must be able to fix it");
+        assert!(app.message.as_ref().unwrap().is_error);
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn args_empty_input_is_rejected() {
+        let mut app = app_with_backend(StubBackend::new());
+        app.on_key(key(KeyCode::Char('a')));
+        type_str(&mut app, "   ");
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(app.args_input.is_some());
+        assert!(app.message.as_ref().unwrap().is_error);
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn args_valid_input_queues_the_expanded_action() {
+        let mut app = app_with_backend(StubBackend::new());
+        app.on_key(key(KeyCode::Char('a')));
+        type_str(&mut app, "-s 20000,-m powersave");
+        app.on_key(key(KeyCode::Enter));
+
+        assert!(app.args_input.is_none(), "a queued action closes the field");
+        let Some(PendingAction::StartOrSwitchWithArgs(args)) = &app.pending_action else {
+            panic!("expected a queued with-args action");
+        };
+        assert_eq!(
+            args,
+            &["-s", "20000", "-m", "powersave"]
+                .map(str::to_string)
+                .to_vec()
+        );
     }
 
     #[test]
