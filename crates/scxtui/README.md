@@ -1,6 +1,6 @@
 <p align="center">
   <img
-    src="assets/scxtui-logo.png"
+    src="https://raw.githubusercontent.com/sched-ext/scx-loader/main/crates/scxtui/assets/scxtui-logo.png"
     alt="scxtui logo"
     width="320"
   >
@@ -11,10 +11,8 @@
 **A terminal user interface for managing Linux [`sched_ext`](https://github.com/sched-ext/scx) schedulers through [`scx_loader`](https://github.com/sched-ext/scx-loader) or `scx.service`.**
 
 [![Crates.io](https://img.shields.io/crates/v/scxtui.svg)](https://crates.io/crates/scxtui)
-[![License](https://img.shields.io/crates/l/scxtui.svg)](../../LICENSE)
+[![License](https://img.shields.io/crates/l/scxtui.svg)](https://github.com/sched-ext/scx-loader/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-blue.svg)](#requirements)
-
-</div>
 
 `scxtui` provides an interactive view of the available `sched_ext` schedulers.
 It can start and switch schedulers, select operating modes, inspect the
@@ -43,8 +41,15 @@ unprivileged D-Bus client; scheduler lifecycle management remains in
 - Displays the kernel's own `sched_ext` state from sysfs and warns when it
   disagrees with the backend: schedulers attached outside the backend's
   control, crashed or watchdog-ejected schedulers, and ops-name mismatches.
+- Previews the arguments a selected mode is configured with, rendered in
+  the same shell-words form as `scxctl`, cached per scheduler and refreshed
+  when the daemon restarts.
 - Warns when a selected mode has no configured arguments and scheduler
   defaults will be used.
+- Starts or switches a scheduler with free-form custom arguments, using the
+  exact `--args` syntax and semantics of `scxctl` (comma split, then
+  shell-style words). The arguments are session-only: nothing is written to
+  the loader configuration.
 - Stops, restarts, or restores the configured default scheduler. A restart
   with a different mode selected for the running scheduler applies that
   mode.
@@ -135,6 +140,7 @@ of leaving the terminal in a broken state.
 | `Tab`, `m` | Select the next mode |
 | `Shift+Tab`, `M` | Select the previous mode |
 | `Enter` | Start the selected scheduler, or switch to it when one is already running |
+| `a` | Open the custom-arguments field; `Enter` starts/switches with the typed arguments (session-only), `Esc` cancels |
 | `s` | Stop the running scheduler |
 | `r` | Restart the running scheduler; applies the selected mode when it differs |
 | `d` | Restore the scheduler and mode configured as default |

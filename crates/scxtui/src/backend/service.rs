@@ -21,7 +21,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use scx_loader::SchedMode;
 
-use super::{Capabilities, SchedulerBackend, Status};
+use super::{Capabilities, ModeArgs, SchedulerBackend, Status};
 
 const UNIT: &str = "scx.service";
 /// Debian/Arch convention first, Fedora/openSUSE second.
@@ -223,6 +223,7 @@ impl SchedulerBackend for ServiceBackend {
         Capabilities {
             live_switch: false,
             modes: false,
+            custom_args: false,
             restore_default: false,
         }
     }
@@ -253,8 +254,20 @@ impl SchedulerBackend for ServiceBackend {
         Ok(scheds)
     }
 
-    fn configured_modes(&self, _sched: &str) -> Result<Vec<SchedMode>> {
+    fn mode_args(&self, _sched: &str) -> Result<ModeArgs> {
+        // Unreachable in practice: `modes: false` keeps the UI from asking.
         Ok(Vec::new())
+    }
+
+    fn start_with_args(&self, _sched: &str, _args: &[String]) -> Result<()> {
+        // Unreachable in practice: `custom_args: false` keeps the UI from
+        // asking. scx.service knows only the persistent flags from its
+        // config file — the opposite of the session-only contract.
+        bail!("custom arguments are not supported by the scx.service backend")
+    }
+
+    fn switch_with_args(&self, _sched: &str, _args: &[String]) -> Result<()> {
+        bail!("custom arguments are not supported by the scx.service backend")
     }
 
     fn start(&self, sched: &str, _mode: SchedMode) -> Result<()> {

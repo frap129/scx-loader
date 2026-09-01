@@ -30,7 +30,7 @@ use zbus::names::{BusName, InterfaceName};
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::OwnedValue;
 
-use super::{Capabilities, SchedulerBackend, Status};
+use super::{Capabilities, ModeArgs, SchedulerBackend, Status};
 
 /// Sentinel used by `scx_loader` for "nothing running / not configured".
 const UNKNOWN: &str = "unknown";
@@ -51,13 +51,17 @@ trait Loader {
 
     fn switch_scheduler(&self, scx_name: &str, sched_mode: SchedMode) -> zbus::Result<()>;
 
+    fn start_scheduler_with_args(&self, scx_name: &str, scx_args: &[String]) -> zbus::Result<()>;
+
+    fn switch_scheduler_with_args(&self, scx_name: &str, scx_args: &[String]) -> zbus::Result<()>;
+
     fn stop_scheduler(&self) -> zbus::Result<()>;
 
     fn restart_scheduler(&self) -> zbus::Result<()>;
 
     fn restore_default(&self) -> zbus::Result<()>;
 
-    fn scheduler_modes(&self, scx_name: &str) -> zbus::Result<Vec<SchedMode>>;
+    fn scheduler_mode_args(&self, scx_name: &str) -> zbus::Result<ModeArgs>;
 
     #[zbus(property)]
     fn current_scheduler(&self) -> zbus::Result<String>;
@@ -82,6 +86,10 @@ pub struct LoaderBackend {
     // The generated proxy holds its own reference to the connection,
     // so we don't need to keep the `Connection` around separately.
     proxy: LoaderProxyBlocking<'static>,
+    /// `org.freedesktop.DBus` proxy, kept for `GetNameOwner`: the unique
+    /// name of the current `org.scx.Loader` owner is the instance token
+    /// (see [`SchedulerBackend::instance_token`]).
+    dbus: DBusProxy<'static>,
     /// `org.freedesktop.DBus.Properties` proxy for the same object, used to
     /// fetch the whole status in a single `GetAll` round-trip instead of
     /// five per-property `Get`s (see [`SchedulerBackend::status`]).
@@ -158,6 +166,7 @@ is the scx_loader service installed?"
         Ok(Self {
             proxy,
             props,
+            dbus,
             initial_schedulers: RefCell::new(Some(schedulers)),
         })
     }
@@ -194,8 +203,21 @@ impl SchedulerBackend for LoaderBackend {
         Capabilities {
             live_switch: true,
             modes: true,
+            custom_args: true,
             restore_default: true,
         }
+    }
+
+    /// One cheap round-trip to the bus daemon itself (not to `scx_loader`),
+    /// so it can ride along the periodic status refresh. A momentarily
+    /// unowned name maps to `None` — the caller keeps its caches and a
+    /// later successful read reports the (new) owner.
+    fn instance_token(&self) -> Option<String> {
+        let name = BusName::from_static_str(SERVICE).expect("valid bus name literal");
+        self.dbus
+            .get_name_owner(name)
+            .ok()
+            .map(|owner| owner.to_string())
     }
 
     /// One `GetAll` round-trip instead of five `Get`s. With property
@@ -227,8 +249,8 @@ impl SchedulerBackend for LoaderBackend {
         Ok(self.proxy.supported_schedulers()?)
     }
 
-    fn configured_modes(&self, sched: &str) -> Result<Vec<SchedMode>> {
-        Ok(self.proxy.scheduler_modes(sched)?)
+    fn mode_args(&self, sched: &str) -> Result<ModeArgs> {
+        Ok(self.proxy.scheduler_mode_args(sched)?)
     }
 
     fn start(&self, sched: &str, mode: SchedMode) -> Result<()> {
@@ -237,6 +259,14 @@ impl SchedulerBackend for LoaderBackend {
 
     fn switch(&self, sched: &str, mode: SchedMode) -> Result<()> {
         Ok(self.proxy.switch_scheduler(sched, mode)?)
+    }
+
+    fn start_with_args(&self, sched: &str, args: &[String]) -> Result<()> {
+        Ok(self.proxy.start_scheduler_with_args(sched, args)?)
+    }
+
+    fn switch_with_args(&self, sched: &str, args: &[String]) -> Result<()> {
+        Ok(self.proxy.switch_scheduler_with_args(sched, args)?)
     }
 
     fn stop(&self) -> Result<()> {
